@@ -154,72 +154,87 @@ const App = () => {
         setError('');
         setCoordinates([]);
 
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 30000); // 30-second timeout
+
         try {
             const fileReader = new FileReader();
             fileReader.onload = async (e) => {
-                // Extract base64 data from the Data URL
-                const base64Data = e.target.result.split(',')[1];
-                
-                const prompt = "Extract text from any tables containing coordinate pairs from this PDF document. The table has columns like 'A/A', 'X', and 'Y'. Return only the raw text of the table rows, one row per line. Do not include headers or any other text from the document.";
-                
-                const payload = {
-                    contents: [{
-                        parts: [
-                            { text: prompt },
-                            { inline_data: { mime_type: file.type, data: base64Data } }
-                        ]
-                    }]
-                };
-                
-                const apiKey = process.env.REACT_APP_GEMINI_API_KEY;
-                const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
-
-                const response = await fetch(apiUrl, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(payload)
-                });
-
-                if (!response.ok) {
-                    throw new Error(`API call failed with status: ${response.status}`);
-                }
-
-                const result = await response.json();
-                
-                if (result.candidates && result.candidates[0].content.parts[0].text) {
-                    const extractedText = result.candidates[0].content.parts[0].text;
-                    const parsedCoords = parseCoordinates(extractedText);
+                try {
+                    // Extract base64 data from the Data URL
+                    const base64Data = e.target.result.split(',')[1];
                     
-                    const finalCoordinates = parsedCoords.map((coord, index) => ({
-                        id: index,
-                        x: coord.x,
-                        y: coord.y
-                    }));
+                    const prompt = "Extract text from any tables containing coordinate pairs from this PDF document. The table has columns like 'A/A', 'X', and 'Y'. Return only the raw text of the table rows, one row per line. Do not include headers or any other text from the document.";
+                    
+                    const payload = {
+                        contents: [{
+                            parts: [
+                                { text: prompt },
+                                { inline_data: { mime_type: file.type, data: base64Data } }
+                            ]
+                        }]
+                    };
+                    
+                    const apiKey = process.env.REACT_APP_GEMINI_API_KEY;
+                    const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
 
-                    setCoordinates(finalCoordinates);
+                    const response = await fetch(apiUrl, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload),
+                        signal: controller.signal // Pass the abort signal to the fetch request
+                    });
 
-                    if(finalCoordinates.length === 0) {
-                        setError("Could not find any coordinates. The document might have an unusual format or contain no coordinate tables.");
+                    clearTimeout(timeoutId); // Clear the timeout if the request completes in time
+
+                    if (!response.ok) {
+                        throw new Error(`API call failed with status: ${response.status}`);
                     }
-                } else {
-                     throw new Error("No content found in API response. The document might be empty or unreadable.");
-                }
 
-                setIsLoading(false);
+                    const result = await response.json();
+                    
+                    if (result.candidates && result.candidates[0].content.parts[0].text) {
+                        const extractedText = result.candidates[0].content.parts[0].text;
+                        const parsedCoords = parseCoordinates(extractedText);
+                        
+                        const finalCoordinates = parsedCoords.map((coord, index) => ({
+                            id: index,
+                            x: coord.x,
+                            y: coord.y
+                        }));
+
+                        setCoordinates(finalCoordinates);
+
+                        if(finalCoordinates.length === 0) {
+                            setError("Could not find any coordinates. The document might have an unusual format or contain no coordinate tables.");
+                        }
+                    } else {
+                         throw new Error("No content found in API response. The document might be empty or unreadable.");
+                    }
+                } catch (err) {
+                    if (err.name === 'AbortError') {
+                        setError('The request took too long and was cancelled. Please try again with a smaller file.');
+                    } else {
+                        setError(`An error occurred: ${err.message}. Please try again.`);
+                    }
+                } finally {
+                    setIsLoading(false);
+                }
             };
             
             fileReader.onerror = () => {
                  setError('Failed to read the file.');
                  setIsLoading(false);
+                 clearTimeout(timeoutId);
             };
 
             // Read the file as a Data URL to get the base64 encoding
             fileReader.readAsDataURL(file);
 
         } catch (err) {
-            console.error(err);
             setError(`An error occurred: ${err.message}. Please try again.`);
             setIsLoading(false);
+            clearTimeout(timeoutId);
         }
     };
     
