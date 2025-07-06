@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useCallback } from 'react';
 import { useDropzone } from 'react-dropzone';
 
 // --- React Components ---
@@ -171,7 +171,7 @@ const App = () => {
                     }]
                 };
                 
-                const apiKey = process.env.REACT_APP_GEMINI_API_KEY; // API key is handled by the environment
+                const apiKey = process.env.REACT_APP_GEMINI_API_KEY;
                 const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
 
                 const response = await fetch(apiUrl, {
@@ -230,8 +230,8 @@ const App = () => {
         const textArea = document.createElement("textarea");
         textArea.value = spaceSeparatedContent;
         document.body.appendChild(textArea);
-        textArea.select();
         try {
+            textArea.select();
             document.execCommand('copy');
             setMessage('Copied to clipboard!');
             setTimeout(() => setMessage(''), 2000);
