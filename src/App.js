@@ -1,5 +1,6 @@
 import React, { useState, useCallback } from 'react';
 import { useDropzone } from 'react-dropzone';
+import { pdfToImageDataUrls } from './pdfToImages';
 
 // --- React Components ---
 
@@ -23,23 +24,23 @@ const parseCoordinates = (text) => {
 
     const coordinates = [];
     const lines = text.replace(/\r\n/g, '\n').split('\n');
-    // Regex to find two numbers (integer or decimal with dot or comma) separated by whitespace.
-    const coordinateRegex = /([\d.,]+)\s+([\d.,]+)/;
+    // Match all pairs of numbers (integer or decimal, dot or comma) on each line.
+    const coordinateRegex = /([\d.,]+)\s+([\d.,]+)/g;
 
     for (const line of lines) {
-        // Trim the line and remove any leading A/A number to avoid confusion.
-        const cleanLine = line.trim().replace(/^\d+\s+/, '');
-        const match = cleanLine.match(coordinateRegex);
-
-        if (match) {
+        let cleanLine = line.trim();
+        if (!cleanLine) continue;
+        // Strip optional leading row index (e.g. A/A column) so "1 123,45 456,78" -> "123,45 456,78"
+        cleanLine = cleanLine.replace(/^\d+\s+/, '');
+        let match;
+        coordinateRegex.lastIndex = 0;
+        while ((match = coordinateRegex.exec(cleanLine)) !== null) {
             try {
-                // Parse numbers, allowing for comma as a decimal separator.
                 let val1 = parseFloat(match[1].replace(/,/g, '.'));
                 let val2 = parseFloat(match[2].replace(/,/g, '.'));
 
                 if (isNaN(val1) || isNaN(val2)) continue;
 
-                // Heuristic to correctly identify X and Y based on the typical magnitude of the numbers.
                 let x, y;
                 if (String(Math.trunc(val1)).length > String(Math.trunc(val2)).length) {
                     y = val1;
@@ -154,18 +155,165 @@ const App = () => {
         setError('');
         setCoordinates([]);
 
+        const openRouterKey = process.env.REACT_APP_OPENROUTER_API_KEY;
+        const openaiKey = process.env.REACT_APP_OPENAI_API_KEY;
+        const geminiKey = process.env.REACT_APP_GEMINI_API_KEY;
         const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 30000); // 30-second timeout
+        const timeoutMs = 120000; // 2 min for API extraction
+        const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+        const prompt = "Extract text from any tables containing coordinate pairs from this document. The table has columns like 'A/A', 'X', and 'Y'. Return only the raw text of the table rows, one row per line. Do not include headers or any other text.";
 
-        try {
+        const setExtractError = (err, provider) => {
+            if (err.name === 'AbortError') {
+                setError('The request took too long and was cancelled. Please try again with a smaller file.');
+            } else if (err.status === 429) {
+                const base = 'Rate limit exceeded. Please wait a few minutes and try again.';
+                const hint = provider === 'OpenAI'
+                    ? ' You can check usage and limits at platform.openai.com.'
+                    : provider === 'OpenRouter'
+                    ? ' Check openrouter.ai/dashboard for limits.'
+                    : provider ? ` (${provider})` : '';
+                setError(base + hint);
+            } else {
+                setError(`An error occurred: ${err.message}. Please try again.`);
+            }
+        };
+
+        const applyExtractedText = (extractedText) => {
+            const parsedCoords = parseCoordinates(extractedText);
+            const finalCoordinates = parsedCoords.map((coord, index) => ({
+                id: index,
+                x: coord.x,
+                y: coord.y
+            }));
+            setCoordinates(finalCoordinates);
+            if (finalCoordinates.length === 0) {
+                setError("Could not find any coordinates. The document might have an unusual format or contain no coordinate tables.");
+            }
+        };
+
+        const runOpenAIExtract = async (pdfFile) => {
+            const imageUrls = await pdfToImageDataUrls(pdfFile);
+            const content = [
+                { type: 'text', text: prompt },
+                ...imageUrls.map(url => ({ type: 'image_url', image_url: { url } }))
+            ];
+            const body = JSON.stringify({
+                model: 'gpt-4o',
+                messages: [{ role: 'user', content }],
+                max_tokens: 4096
+            });
+            const doFetch = () => fetch('https://api.openai.com/v1/chat/completions', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${openaiKey}` },
+                body,
+                signal: controller.signal
+            });
+            let response = await doFetch();
+            const backoffSeconds = [8, 20, 45];
+            for (let i = 0; i < backoffSeconds.length && response.status === 429; i++) {
+                await new Promise(r => setTimeout(r, backoffSeconds[i] * 1000));
+                response = await doFetch();
+            }
+            if (!response.ok) throw Object.assign(new Error(`API call failed with status: ${response.status}`), { status: response.status });
+            const result = await response.json();
+            const text = result.choices?.[0]?.message?.content;
+            if (!text) throw new Error("No content found in API response.");
+            return text;
+        };
+
+        const runOpenRouterExtract = async (pdfFile) => {
+            const imageUrls = await pdfToImageDataUrls(pdfFile);
+            const content = [
+                { type: 'text', text: prompt },
+                ...imageUrls.map(url => ({ type: 'image_url', image_url: { url } }))
+            ];
+            const openRouterModels = [
+                'google/gemini-2.0-flash-001',
+                'google/gemini-2.0-flash-exp:free',
+                'google/gemini-2.0-flash-exp'
+            ];
+            let lastError;
+            for (const model of openRouterModels) {
+                const body = JSON.stringify({
+                    model,
+                    messages: [{ role: 'user', content }],
+                    max_tokens: 4096
+                });
+                const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${openRouterKey}`,
+                        'HTTP-Referer': window.location.origin || 'https://localhost:3000'
+                    },
+                    body,
+                    signal: controller.signal
+                });
+                if (response.ok) {
+                    const result = await response.json();
+                    const text = result.choices?.[0]?.message?.content;
+                    if (text) return text;
+                }
+                lastError = Object.assign(new Error(`API call failed with status: ${response.status}`), { status: response.status });
+                if (response.status !== 404) break;
+            }
+            throw lastError;
+        };
+
+        // Try OpenRouter first (free tier). On any failure, fall back to Gemini then OpenAI so one working key is enough.
+        if (openRouterKey) {
+            (async () => {
+                try {
+                    const text = await runOpenRouterExtract(file);
+                    clearTimeout(timeoutId);
+                    applyExtractedText(text);
+                } catch (err) {
+                    clearTimeout(timeoutId);
+                    if (geminiKey) {
+                        try {
+                            const base64Data = await new Promise((resolve, reject) => {
+                                const fr = new FileReader();
+                                fr.onload = () => resolve(fr.result.split(',')[1]);
+                                fr.onerror = () => reject(new Error('Failed to read file'));
+                                fr.readAsDataURL(file);
+                            });
+                            const payload = {
+                                contents: [{ parts: [{ text: prompt }, { inline_data: { mime_type: file.type, data: base64Data } }] }]
+                            };
+                            const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${geminiKey}`, {
+                                method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload), signal: controller.signal
+                            });
+                            if (res.ok) {
+                                const data = await res.json();
+                                const t = data.candidates?.[0]?.content?.parts?.[0]?.text;
+                                if (t) { applyExtractedText(t); setIsLoading(false); return; }
+                            }
+                        } catch (_) {}
+                    }
+                    if (openaiKey) {
+                        try {
+                            const t = await runOpenAIExtract(file);
+                            applyExtractedText(t);
+                            setIsLoading(false);
+                            return;
+                        } catch (_) {}
+                    }
+                    setExtractError(err, 'OpenRouter');
+                } finally {
+                    setIsLoading(false);
+                }
+            })();
+            return;
+        }
+
+        // Prefer Gemini first (accepts PDF directly, avoids OpenAI rate limits). Fall back to OpenAI if only OpenAI key is set.
+        if (geminiKey) {
+            // --- Gemini: PDF base64 → Generate Content API. On 429: fall back to OpenAI if available, else retry with backoff. ---
             const fileReader = new FileReader();
             fileReader.onload = async (e) => {
                 try {
-                    // Extract base64 data from the Data URL
                     const base64Data = e.target.result.split(',')[1];
-                    
-                    const prompt = "Extract text from any tables containing coordinate pairs from this PDF document. The table has columns like 'A/A', 'X', and 'Y'. Return only the raw text of the table rows, one row per line. Do not include headers or any other text from the document.";
-                    
                     const payload = {
                         contents: [{
                             parts: [
@@ -174,70 +322,123 @@ const App = () => {
                             ]
                         }]
                     };
-                    
-                    const apiKey = process.env.REACT_APP_GEMINI_API_KEY;
-                    const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
-
-                    const response = await fetch(apiUrl, {
+                    const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${geminiKey}`;
+                    let response = await fetch(apiUrl, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify(payload),
-                        signal: controller.signal // Pass the abort signal to the fetch request
+                        signal: controller.signal
                     });
 
-                    clearTimeout(timeoutId); // Clear the timeout if the request completes in time
-
-                    if (!response.ok) {
-                        throw new Error(`API call failed with status: ${response.status}`);
+                    if (response.status === 429 && openaiKey) {
+                        clearTimeout(timeoutId);
+                        try {
+                            const text = await runOpenAIExtract(file);
+                            applyExtractedText(text);
+                        } catch (fallbackErr) {
+                            setExtractError(fallbackErr, 'OpenAI');
+                        }
+                        setIsLoading(false);
+                        return;
                     }
 
-                    const result = await response.json();
-                    
-                    if (result.candidates && result.candidates[0].content.parts[0].text) {
-                        const extractedText = result.candidates[0].content.parts[0].text;
-                        const parsedCoords = parseCoordinates(extractedText);
-                        
-                        const finalCoordinates = parsedCoords.map((coord, index) => ({
-                            id: index,
-                            x: coord.x,
-                            y: coord.y
-                        }));
-
-                        setCoordinates(finalCoordinates);
-
-                        if(finalCoordinates.length === 0) {
-                            setError("Could not find any coordinates. The document might have an unusual format or contain no coordinate tables.");
+                    if (response.status === 429) {
+                        const backoff = [10, 30, 60];
+                        for (let i = 0; i < backoff.length; i++) {
+                            await new Promise(r => setTimeout(r, backoff[i] * 1000));
+                            response = await fetch(apiUrl, {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify(payload),
+                                signal: controller.signal
+                            });
+                            if (response.ok) break;
+                            if (response.status !== 429) break;
                         }
+                    }
+
+                    clearTimeout(timeoutId);
+                    if (!response.ok) {
+                        const err = new Error(`API call failed with status: ${response.status}`);
+                        err.status = response.status;
+                        throw err;
+                    }
+                    const result = await response.json();
+                    if (result.candidates?.[0]?.content?.parts?.[0]?.text) {
+                        applyExtractedText(result.candidates[0].content.parts[0].text);
                     } else {
-                         throw new Error("No content found in API response. The document might be empty or unreadable.");
+                        throw new Error("No content found in API response. The document might be empty or unreadable.");
                     }
                 } catch (err) {
-                    if (err.name === 'AbortError') {
-                        setError('The request took too long and was cancelled. Please try again with a smaller file.');
-                    } else {
-                        setError(`An error occurred: ${err.message}. Please try again.`);
-                    }
+                    setExtractError(err, 'Gemini');
                 } finally {
                     setIsLoading(false);
                 }
             };
-            
             fileReader.onerror = () => {
-                 setError('Failed to read the file.');
-                 setIsLoading(false);
-                 clearTimeout(timeoutId);
+                setError('Failed to read the file.');
+                setIsLoading(false);
+                clearTimeout(timeoutId);
             };
-
-            // Read the file as a Data URL to get the base64 encoding
             fileReader.readAsDataURL(file);
-
-        } catch (err) {
-            setError(`An error occurred: ${err.message}. Please try again.`);
-            setIsLoading(false);
-            clearTimeout(timeoutId);
+            return;
         }
+
+        if (openaiKey) {
+            // --- OpenAI: PDF → images → Vision API. On 429, retry with backoff. ---
+            (async () => {
+                try {
+                    const imageUrls = await pdfToImageDataUrls(file);
+                    const content = [
+                        { type: 'text', text: prompt },
+                        ...imageUrls.map(url => ({ type: 'image_url', image_url: { url } }))
+                    ];
+                    const body = JSON.stringify({
+                        model: 'gpt-4o',
+                        messages: [{ role: 'user', content }],
+                        max_tokens: 4096
+                    });
+                    const doOpenAIFetch = () => fetch('https://api.openai.com/v1/chat/completions', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'Authorization': `Bearer ${openaiKey}`
+                        },
+                        body,
+                        signal: controller.signal
+                    });
+
+                    let response = await doOpenAIFetch();
+                    const backoffSeconds = [8, 20, 45];
+                    for (let i = 0; i < backoffSeconds.length && response.status === 429; i++) {
+                        await new Promise(r => setTimeout(r, backoffSeconds[i] * 1000));
+                        response = await doOpenAIFetch();
+                    }
+                    clearTimeout(timeoutId);
+
+                    if (!response.ok) {
+                        const err = new Error(`API call failed with status: ${response.status}`);
+                        err.status = response.status;
+                        throw err;
+                    }
+                    const result = await response.json();
+                    const text = result.choices?.[0]?.message?.content;
+                    if (!text) throw new Error("No content found in API response. The document might be empty or unreadable.");
+                    applyExtractedText(text);
+                } catch (err) {
+                    setExtractError(err, 'OpenAI');
+                } finally {
+                    setIsLoading(false);
+                }
+            })();
+            return;
+        }
+
+        setError('No API key configured. Add REACT_APP_OPENROUTER_API_KEY, REACT_APP_GEMINI_API_KEY, or REACT_APP_OPENAI_API_KEY to your .env file.');
+        setIsLoading(false);
+        clearTimeout(timeoutId);
     };
-    
+
     const copyToClipboard = () => {
         if (coordinates.length === 0) return;
         const spaceSeparatedContent = coordinates.map(c => `${c.x} ${c.y}`).join("\n");
@@ -279,19 +480,20 @@ const App = () => {
                                 </div>
                             )}
                         </div>
-                        <div className="flex flex-col items-center justify-center space-y-3">
-                             <h2 className="text-2xl font-semibold text-gray-700 mb-4 self-start">2. Actions</h2>
+                        <div className="flex flex-col items-stretch space-y-3">
+                            <h2 className="text-2xl font-semibold text-gray-700 mb-1">2. Actions</h2>
                             <button
                                 onClick={handleExtract}
                                 disabled={!file || isLoading}
-                                className="w-full px-6 py-3 bg-blue-600 text-white font-semibold rounded-lg shadow-md hover:bg-blue-700 transition-all duration-300 disabled:bg-gray-400 disabled:cursor-not-allowed transform hover:scale-105"
+                                className="w-full px-6 py-3 bg-blue-600 text-white font-semibold rounded-lg shadow-md hover:bg-blue-700 transition-colors disabled:bg-gray-400 disabled:cursor-not-allowed"
                             >
-                                {isLoading ? 'Extracting...' : 'Extract Coordinates'}
+                                {isLoading ? 'Extracting...' : 'Extract Coordinates (AI)'}
                             </button>
                             <button
+                                type="button"
                                 onClick={resetState}
                                 disabled={isLoading || !file}
-                                className="w-full px-6 py-2 bg-red-500 text-white font-semibold rounded-lg shadow-md hover:bg-red-600 transition-all duration-300 disabled:bg-gray-400"
+                                className="w-full px-6 py-2 bg-red-500 text-white font-semibold rounded-lg shadow-md hover:bg-red-600 transition-colors disabled:bg-gray-400"
                             >
                                 Clear
                             </button>
@@ -301,7 +503,7 @@ const App = () => {
                     {isLoading && (
                         <div className="text-center p-8">
                             <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-500 mx-auto"></div>
-                            <p className="mt-4 text-gray-600">Analyzing PDF with Gemini...</p>
+                            <p className="mt-4 text-gray-600">Analyzing PDF…</p>
                         </div>
                     )}
 
@@ -322,7 +524,7 @@ const App = () => {
                     
                 </div>
                  <footer className="text-center mt-8 text-gray-500 text-sm">
-                    <p>Powered by Gemini</p>
+                    <p>Powered by Gemini or OpenAI</p>
                 </footer>
             </div>
         </div>

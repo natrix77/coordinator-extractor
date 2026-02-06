@@ -1,0 +1,7 @@
+{"location":"App.js:handleExtract","message":"start","data":{"hasOpenAI":true,"hasGemini":true,"fileName":"geoxorikos_enosi_xodriano_faraggi_250611_141938_ενιαιο.pdf"},"timestamp":1770385456850,"sessionId":"debug-session","hypothesisId":"A"}
+{"location":"App.js:handleExtract","message":"OpenAI path: calling pdfToImageDataUrls","data":{},"timestamp":1770385456851,"sessionId":"debug-session","hypothesisId":"A"}
+{"location":"App.js:handleExtract","message":"start","data":{"hasOpenAI":true,"hasGemini":true,"fileName":"TOPO_ag_eustathios.pdf"},"timestamp":1770385482790,"sessionId":"debug-session","hypothesisId":"A"}
+{"location":"App.js:handleExtract","message":"OpenAI path: calling pdfToImageDataUrls","data":{},"timestamp":1770385482791,"sessionId":"debug-session","hypothesisId":"A"}
+{"location":"App.js:handleExtractLocally","message":"start","data":{"fileName":"geoxorikos_enosi_xodriano_faraggi_250611_141938_ενιαιο.pdf","size":1831667},"timestamp":1770385494341,"sessionId":"debug-session","hypothesisId":"E"}
+{"location":"App.js:handleExtractLocally","message":"pdfToText done","data":{"textLength":0,"textPreview":""},"timestamp":1770385494904,"sessionId":"debug-session","hypothesisId":"E"}
+{"location":"App.js:handleExtractLocally","message":"parseCoordinates done","data":{"parsedCount":0},"timestamp":1770385494904,"sessionId":"debug-session","hypothesisId":"E"}

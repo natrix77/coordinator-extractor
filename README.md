@@ -2,6 +2,22 @@
 
 This project was bootstrapped with [Create React App](https://github.com/facebook/create-react-app).
 
+## Coordinate Extractor
+
+Upload a PDF to extract coordinate pairs (e.g. from tables with A/A, X, Y columns) using AI.
+
+### API keys (use at least one)
+
+Create a `.env` file in the project root (do not commit it). Use **one or more** of:
+
+- **OpenRouter (free tier)** – set `REACT_APP_OPENROUTER_API_KEY=sk-or-...` (from [OpenRouter](https://openrouter.ai/keys)). Uses free vision models (e.g. Gemini Flash via OpenRouter). **Tried first** when set.
+- **Google Gemini** – set `REACT_APP_GEMINI_API_KEY=...` (from [Google AI Studio](https://aistudio.google.com/)). The app sends the PDF directly to Gemini.
+- **OpenAI** – set `REACT_APP_OPENAI_API_KEY=sk-...` (from [OpenAI API keys](https://platform.openai.com/api-keys)). Converts PDF to images and uses the Vision API (e.g. gpt-4o).
+
+**Order when multiple are set:** OpenRouter → Gemini → OpenAI. On rate limit (429), the app falls back to the next configured provider.
+
+**Testing:** You can use a survey/coordinate PDF (e.g. Greek cadastre-style documents with X,Y tables). Use **Extract locally (no API)** for text-based PDFs when APIs are rate limited.
+
 ## Available Scripts
 
 In the project directory, you can run:

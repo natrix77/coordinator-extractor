@@ -1,8 +1,14 @@
 import { render, screen } from '@testing-library/react';
 import App from './App';
 
-test('renders learn react link', () => {
+test('renders Coordinate Extractor heading', () => {
   render(<App />);
-  const linkElement = screen.getByText(/learn react/i);
-  expect(linkElement).toBeInTheDocument();
+  const heading = screen.getByText(/Coordinate Extractor/i);
+  expect(heading).toBeInTheDocument();
+});
+
+test('renders upload instructions', () => {
+  render(<App />);
+  const instructions = screen.getByText(/Upload a PDF to automatically extract coordinate pairs/i);
+  expect(instructions).toBeInTheDocument();
 });
