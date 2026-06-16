@@ -2,6 +2,12 @@ import React, { useState, useCallback } from 'react';
 import { useDropzone } from 'react-dropzone';
 import { pdfToImageDataUrls } from './pdfToImages';
 
+const GEMINI_MODEL = 'gemini-2.5-flash';
+const OPENROUTER_MODELS = [
+    'google/gemini-2.5-flash',
+    'google/gemini-2.5-flash-lite',
+];
+
 // --- React Components ---
 
 const Icon = ({ path, className = "w-6 h-6" }) => (
@@ -228,13 +234,8 @@ const App = () => {
                 { type: 'text', text: prompt },
                 ...imageUrls.map(url => ({ type: 'image_url', image_url: { url } }))
             ];
-            const openRouterModels = [
-                'google/gemini-2.0-flash-001',
-                'google/gemini-2.0-flash-exp:free',
-                'google/gemini-2.0-flash-exp'
-            ];
             let lastError;
-            for (const model of openRouterModels) {
+            for (const model of OPENROUTER_MODELS) {
                 const body = JSON.stringify({
                     model,
                     messages: [{ role: 'user', content }],
@@ -270,6 +271,7 @@ const App = () => {
                     applyExtractedText(text);
                 } catch (err) {
                     clearTimeout(timeoutId);
+                    let lastErr = err;
                     if (geminiKey) {
                         try {
                             const base64Data = await new Promise((resolve, reject) => {
@@ -281,15 +283,19 @@ const App = () => {
                             const payload = {
                                 contents: [{ parts: [{ text: prompt }, { inline_data: { mime_type: file.type, data: base64Data } }] }]
                             };
-                            const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${geminiKey}`, {
+                            const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${geminiKey}`, {
                                 method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload), signal: controller.signal
                             });
-                            if (res.ok) {
-                                const data = await res.json();
-                                const t = data.candidates?.[0]?.content?.parts?.[0]?.text;
-                                if (t) { applyExtractedText(t); setIsLoading(false); return; }
+                            if (!res.ok) {
+                                throw Object.assign(new Error(`API call failed with status: ${res.status}`), { status: res.status });
                             }
-                        } catch (_) {}
+                            const data = await res.json();
+                            const t = data.candidates?.[0]?.content?.parts?.[0]?.text;
+                            if (t) { applyExtractedText(t); setIsLoading(false); return; }
+                            throw new Error('No content found in API response.');
+                        } catch (fallbackErr) {
+                            lastErr = fallbackErr;
+                        }
                     }
                     if (openaiKey) {
                         try {
@@ -297,9 +303,11 @@ const App = () => {
                             applyExtractedText(t);
                             setIsLoading(false);
                             return;
-                        } catch (_) {}
+                        } catch (fallbackErr) {
+                            lastErr = fallbackErr;
+                        }
                     }
-                    setExtractError(err, 'OpenRouter');
+                    setExtractError(lastErr, lastErr === err ? 'OpenRouter' : (geminiKey ? 'Gemini' : 'OpenAI'));
                 } finally {
                     setIsLoading(false);
                 }
@@ -322,7 +330,7 @@ const App = () => {
                             ]
                         }]
                     };
-                    const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${geminiKey}`;
+                    const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${geminiKey}`;
                     let response = await fetch(apiUrl, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
