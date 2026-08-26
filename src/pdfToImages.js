@@ -14,17 +14,55 @@ const TILE_SCALE = 2.2;
 const MAX_PAGES = 10; // Limit pages to avoid huge payloads and timeouts
 const LARGE_PAGE_PT = 1400; // Scanned topo sheets are often much larger than this
 
+const abortError = () => {
+  const err = new Error('Aborted');
+  err.name = 'AbortError';
+  return err;
+};
+
+const renderPageRegion = async (page, viewport, { sx = 0, sy = 0, w, h, signal, label, onProgress }) => {
+  if (signal?.aborted) throw abortError();
+  onProgress?.(label);
+  const canvas = document.createElement('canvas');
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext('2d');
+  if (sx || sy) ctx.setTransform(1, 0, 0, 1, -sx, -sy);
+  const renderTask = page.render({
+    canvasContext: ctx,
+    viewport,
+    intent: 'display',
+  });
+  const onAbort = () => renderTask.cancel();
+  signal?.addEventListener('abort', onAbort);
+  try {
+    await renderTask.promise;
+  } catch (e) {
+    if (signal?.aborted || e?.name === 'RenderingCancelledException') throw abortError();
+    throw e;
+  } finally {
+    signal?.removeEventListener('abort', onAbort);
+  }
+  if (signal?.aborted) throw abortError();
+  return canvas.toDataURL('image/jpeg', 0.85);
+};
+
 /**
  * @param {File} file - PDF file
- * @returns {Promise<string[]>} Array of data URLs (image/png)
+ * @param {{ signal?: AbortSignal, onProgress?: (msg: string) => void }} [options]
+ * @returns {Promise<string[]>} Array of data URLs (image/jpeg)
  */
-export async function pdfToImageDataUrls(file) {
+export async function pdfToImageDataUrls(file, { signal, onProgress } = {}) {
+  if (signal?.aborted) throw abortError();
+  onProgress?.('Loading PDF…');
   const arrayBuffer = await file.arrayBuffer();
+  if (signal?.aborted) throw abortError();
   const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
   const numPages = Math.min(pdf.numPages, MAX_PAGES);
   const dataUrls = [];
 
   for (let i = 1; i <= numPages; i++) {
+    if (signal?.aborted) throw abortError();
     const page = await pdf.getPage(i);
     const baseViewport = page.getViewport({ scale: 1 });
     const isLargePage = baseViewport.width > LARGE_PAGE_PT || baseViewport.height > LARGE_PAGE_PT;
@@ -37,37 +75,29 @@ export async function pdfToImageDataUrls(file) {
       const tileH = Math.ceil(viewport.height / 2);
       const overlapX = Math.round(tileW * 0.12);
       const overlapY = Math.round(tileH * 0.12);
+      let tileIndex = 0;
       for (let row = 0; row < 2; row++) {
         for (let col = 0; col < 2; col++) {
+          tileIndex += 1;
           const sx = Math.max(0, col * tileW - overlapX);
           const sy = Math.max(0, row * tileH - overlapY);
           const w = Math.min(viewport.width - sx, tileW + overlapX);
           const h = Math.min(viewport.height - sy, tileH + overlapY);
-          const canvas = document.createElement('canvas');
-          canvas.width = w;
-          canvas.height = h;
-          const ctx = canvas.getContext('2d');
-          ctx.setTransform(1, 0, 0, 1, -sx, -sy);
-          await page.render({
-            canvasContext: ctx,
-            viewport,
-            intent: 'display',
-          }).promise;
-          dataUrls.push(canvas.toDataURL('image/png'));
+          dataUrls.push(await renderPageRegion(page, viewport, {
+            sx, sy, w, h, signal, onProgress,
+            label: `Rendering page ${i}, tile ${tileIndex} of 4…`,
+          }));
         }
       }
     } else {
       const viewport = page.getViewport({ scale: SCALE });
-      const canvas = document.createElement('canvas');
-      canvas.width = viewport.width;
-      canvas.height = viewport.height;
-      const ctx = canvas.getContext('2d');
-      await page.render({
-        canvasContext: ctx,
-        viewport,
-        intent: 'display',
-      }).promise;
-      dataUrls.push(canvas.toDataURL('image/png'));
+      dataUrls.push(await renderPageRegion(page, viewport, {
+        w: viewport.width,
+        h: viewport.height,
+        signal,
+        onProgress,
+        label: `Rendering page ${i} of ${numPages}…`,
+      }));
     }
   }
 
