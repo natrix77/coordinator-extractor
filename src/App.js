@@ -7,13 +7,13 @@ const GEMINI_MODEL = 'gemini-3.6-flash';
 const HAS_GEMINI_KEY = Boolean(process.env.REACT_APP_GEMINI_API_KEY);
 
 const EXTRACT_PROMPT = `Return exactly this format:
-AREA <printed ΕΜΒΑΔΟΝ in m² with a dot decimal, or NONE>
+AREA <printed ΕΜΒΑΔΟΝ / Εμβαδόν in m² with a dot decimal, or NONE>
 COUNT <last A/A number in the coordinate table>
-Then one line per vertex from first to last:
+Then one line per vertex from first to last, in A/A order:
 <A/A> <X> <Y> <L>
-L is the printed length to the NEXT vertex; the last L is the closing side back to vertex 1.
+L is the printed length to the NEXT vertex if a length column exists; otherwise use 0. The last L is the closing side back to vertex 1.
 
-The first images are high-resolution crops of the coordinate table (ΠΙΝΑΚΑΣ ΣΥΝΤΕΤΑΓΜΕΝΩΝ), top to bottom with overlap; later images are overviews. Mentally join the table crops into one table. Copy EVERY numbered row (often 10–80 vertices). Do not stop after the first 10–20 rows. Do not skip, merge, interpolate, or invent points. No headers and no other text.`;
+If the table is split into two or more columns, read the LEFT column top to bottom, then the RIGHT column top to bottom. Continue through every page. Copy EVERY numbered row (often 10–200 vertices). Do not stop after the first 10–20 rows. Do not skip, merge, interpolate, or invent points. No headers and no other text.`;
 
 // --- React Components ---
 
@@ -83,6 +83,21 @@ const ResultsTable = ({ coordinates, analysis, source, onCopyToClipboard }) => (
                 )}
                 {' · '}
                 Closing side: <strong>{analysis.gap.toFixed(2)} m</strong>
+            </div>
+        )}
+        {analysis?.checks?.length > 0 && (
+            <div className="mb-3 p-3 bg-gray-50 border border-gray-200 rounded-lg text-sm">
+                <strong className="text-gray-700">Error checks (beyond missing rows):</strong>
+                <ul className="mt-2 space-y-1">
+                    {analysis.checks.map((c) => (
+                        <li key={c.id} className="flex items-start gap-2">
+                            <span className={c.ok === true ? 'text-green-700' : c.ok === false ? 'text-red-700' : 'text-gray-400'}>
+                                {c.ok === true ? 'OK' : c.ok === false ? 'FAIL' : 'n/a'}
+                            </span>
+                            <span className="text-gray-700">{c.label}</span>
+                        </li>
+                    ))}
+                </ul>
             </div>
         )}
         {analysis?.quality === 'verified' && (

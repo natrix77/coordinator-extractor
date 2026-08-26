@@ -137,6 +137,58 @@ test('parses printed area and vertex count from drawing text', () => {
     expect(parsePrintedArea('ΕΜΒΑΔΟΝ 4.197,62 m²')).toBeCloseTo(4197.62);
 });
 
+test('does not treat printed area as a Y coordinate', () => {
+    const text = `
+AREA 1561104.25
+COUNT 10
+1 471558.24 3909604.56 0
+2 471560.10 3909606.20 0
+`;
+    const coords = parseCoordinates(text);
+    expect(coords[0]).toEqual({ x: '471558.24', y: '3909604.56' });
+    expect(coords.every((c) => parseFloat(c.y) >= 3500000)).toBe(true);
+});
+
+test('flags a digit error that lands outside the EGSA range', () => {
+    const coords = [
+        { x: '516058.95', y: '1917188.61' },
+        { x: '516066.19', y: '3917187.36' },
+        { x: '516073.84', y: '3917186.65' },
+        { x: '516079.66', y: '3917186.84' },
+    ];
+    const analysis = analyzeCoordinates(coords);
+    expect(analysis.quality).toBe('review');
+    expect(analysis.checks.find((c) => c.id === 'range').ok).toBe(false);
+});
+
+test('flags a duplicated vertex that is not the closing point', () => {
+    const coords = [
+        { x: '516000.00', y: '3917000.00' },
+        { x: '516010.00', y: '3917000.00' },
+        { x: '516000.00', y: '3917000.00' },
+        { x: '516000.00', y: '3917010.00' },
+    ];
+    const analysis = analyzeCoordinates(coords);
+    expect(analysis.checks.find((c) => c.id === 'duplicates').ok).toBe(false);
+});
+
+test('a matching printed area allows a real long boundary side', () => {
+    const coords = [
+        { x: '516000.00', y: '3917000.00' },
+        { x: '516200.00', y: '3917000.00' },
+        { x: '516200.00', y: '3917100.00' },
+        { x: '516000.00', y: '3917100.00' },
+        { x: '516000.00', y: '3917080.00' },
+        { x: '516020.00', y: '3917080.00' },
+        { x: '516020.00', y: '3917060.00' },
+        { x: '516000.00', y: '3917060.00' },
+    ];
+    const area = polygonArea(coords);
+    const analysis = analyzeCoordinates(coords, { printedArea: area });
+    expect(analysis.quality).toBe('verified');
+    expect(analysis.checks.find((c) => c.id === 'jumps').ok).toBe(true);
+});
+
 test('marks a polygon verified when area and side lengths match the drawing', () => {
     const square = [
         { x: '516000.00', y: '3917000.00' },
