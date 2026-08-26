@@ -14,7 +14,7 @@ test('renders Coordinate Extractor heading', () => {
 
 test('renders upload instructions', () => {
   render(<App />);
-  const instructions = screen.getByText(/Upload a PDF to automatically extract coordinate pairs/i);
+  const instructions = screen.getByText(/Upload a topographic PDF/i);
   expect(instructions).toBeInTheDocument();
 });
 

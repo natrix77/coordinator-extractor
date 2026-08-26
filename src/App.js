@@ -1,10 +1,19 @@
 import React, { useState, useCallback, useEffect } from 'react';
 import { useDropzone } from 'react-dropzone';
-import { pdfToImageDataUrls } from './pdfToImages';
-import { parseCoordinates, analyzeCoordinates, formatArea } from './coordinates';
+import { pdfToImageDataUrls, pdfToText } from './pdfToImages';
+import { parseCoordinates, analyzeCoordinates, formatArea, mergeCoordinateLists, shouldContinueExtraction, buildExtractionMeta } from './coordinates';
 
 const GEMINI_MODEL = 'gemini-3.6-flash';
 const HAS_GEMINI_KEY = Boolean(process.env.REACT_APP_GEMINI_API_KEY);
+
+const EXTRACT_PROMPT = `Return exactly this format:
+AREA <printed ΕΜΒΑΔΟΝ in m² with a dot decimal, or NONE>
+COUNT <last A/A number in the coordinate table>
+Then one line per vertex from first to last:
+<A/A> <X> <Y> <L>
+L is the printed length to the NEXT vertex; the last L is the closing side back to vertex 1.
+
+The first images are high-resolution crops of the coordinate table (ΠΙΝΑΚΑΣ ΣΥΝΤΕΤΑΓΜΕΝΩΝ), top to bottom with overlap; later images are overviews. Mentally join the table crops into one table. Copy EVERY numbered row (often 10–80 vertices). Do not stop after the first 10–20 rows. Do not skip, merge, interpolate, or invent points. No headers and no other text.`;
 
 // --- React Components ---
 
@@ -45,7 +54,7 @@ const Dropzone = ({ onFileAccepted, disabled }) => {
     );
 };
 
-const ResultsTable = ({ coordinates, analysis, onCopyToClipboard }) => (
+const ResultsTable = ({ coordinates, analysis, source, onCopyToClipboard }) => (
     <div className="mt-6">
         <div className="flex justify-between items-center mb-2">
             <h3 className="text-xl font-semibold text-gray-700">
@@ -60,15 +69,43 @@ const ResultsTable = ({ coordinates, analysis, onCopyToClipboard }) => (
                 <span className="ml-2">Copy X Y</span>
             </button>
         </div>
+        {source && (
+            <p className="mb-2 text-sm text-gray-500">{source}</p>
+        )}
         {analysis && (
             <div className="mb-3 text-sm text-gray-600">
                 Computed area: <strong>{formatArea(analysis.area)} m²</strong>
+                {analysis.printedArea != null && (
+                    <>
+                        {' · '}
+                        Printed ΕΜΒΑΔΟΝ: <strong>{formatArea(analysis.printedArea)} m²</strong>
+                    </>
+                )}
                 {' · '}
                 Closing side: <strong>{analysis.gap.toFixed(2)} m</strong>
-                <span className="ml-1 text-gray-500">(compare area with ΕΜΒΑΔΟΝ on the drawing)</span>
             </div>
         )}
-        {analysis?.warnings?.length > 0 && (
+        {analysis?.quality === 'verified' && (
+            <div className="mb-3 p-3 bg-green-50 text-green-900 border border-green-300 rounded-lg text-sm">
+                <strong>Verified against the drawing.</strong> Computed area matches printed ΕΜΒΑΔΟΝ and/or consecutive sides match the printed L column.
+            </div>
+        )}
+        {analysis?.quality === 'consistent' && (
+            <div className="mb-3 p-3 bg-sky-50 text-sky-900 border border-sky-300 rounded-lg text-sm">
+                <strong>Geometry looks consistent</strong> (no missing-vertex jumps). Compare the computed area with ΕΜΒΑΔΟΝ on the drawing before use.
+            </div>
+        )}
+        {analysis?.quality === 'review' && (
+            <div className="mb-3 p-3 bg-red-50 text-red-900 border border-red-300 rounded-lg text-sm">
+                <strong>Do not use these coordinates as a final result.</strong>
+                <ul className="list-disc ml-5 mt-1">
+                    {(analysis.warnings || []).map((w, i) => (
+                        <li key={i}>{w}</li>
+                    ))}
+                </ul>
+            </div>
+        )}
+        {analysis?.quality !== 'review' && analysis?.warnings?.length > 0 && (
             <div className="mb-3 p-3 bg-amber-50 text-amber-900 border border-amber-300 rounded-lg text-sm">
                 <strong>Check extraction quality:</strong>
                 <ul className="list-disc ml-5 mt-1">
@@ -106,6 +143,8 @@ const formatElapsed = (sec) => `${Math.floor(sec / 60)}:${String(sec % 60).padSt
 const App = () => {
     const [file, setFile] = useState(null);
     const [coordinates, setCoordinates] = useState([]);
+    const [extractMeta, setExtractMeta] = useState(null);
+    const [extractSource, setExtractSource] = useState('');
     const [isLoading, setIsLoading] = useState(false);
     const [extractStatus, setExtractStatus] = useState('');
     const [elapsedSec, setElapsedSec] = useState(0);
@@ -133,6 +172,8 @@ const App = () => {
     const resetState = () => {
         setFile(null);
         setCoordinates([]);
+        setExtractMeta(null);
+        setExtractSource('');
         setIsLoading(false);
         setExtractStatus('');
         setError('');
@@ -145,20 +186,16 @@ const App = () => {
             return;
         }
 
-        const geminiKey = process.env.REACT_APP_GEMINI_API_KEY;
-        if (!geminiKey) {
-            setError('Gemini is not configured in this site build. In Netlify, set REACT_APP_GEMINI_API_KEY, then Deploys -> Trigger deploy -> Clear cache and deploy site.');
-            return;
-        }
-
         setIsLoading(true);
-        setExtractStatus('Starting Gemini...');
+        setExtractStatus('Reading PDF…');
         setError('');
         setCoordinates([]);
+        setExtractMeta(null);
+        setExtractSource('');
 
         const controller = new AbortController();
         let cancelled = false;
-        const timeoutMs = 180000;
+        const timeoutMs = 300000;
         const timeoutId = setTimeout(() => {
             cancelled = true;
             controller.abort();
@@ -167,74 +204,115 @@ const App = () => {
             setError('The request took too long and was cancelled. Please try again with a smaller file.');
         }, timeoutMs);
         const isCancelled = () => cancelled || controller.signal.aborted;
-        const prompt = "Extract EVERY row from the vertex coordinate table (ΠΙΝΑΚΑΣ ΣΥΝΤΕΤΑΓΜΕΝΩΝ / columns A/A or Κορυφές, X, Y). Return one vertex per line as: index X Y using the exact printed digits. Copy every numbered row from first to last. Do not skip, merge, interpolate, or invent points. Do not include the L/πλευρά length column, headers, or any other text.";
+        const withIds = (coords) => coords.map((coord, index) => ({ id: index + 1, x: coord.x, y: coord.y }));
+        const continuationPrompt = (coords) => {
+            const start = Math.max(0, coords.length - 8);
+            const tail = coords.slice(start).map((c, i) => `${start + i + 1} ${c.x} ${c.y}`).join('\n');
+            return `You already transcribed the start of the table (${coords.length} vertices so far). The last vertices were:\n${tail}\n\nContinue from the NEXT numbered row after that. Extract ALL remaining rows until the last vertex (often numbered 50–80). Keep the same format: AREA / COUNT then lines of A/A X Y L. Return remaining rows only. Do not invent points.`;
+        };
 
         (async () => {
             try {
+                setExtractStatus('Reading PDF text layer…');
+                try {
+                    const nativeText = await pdfToText(file);
+                    if (isCancelled()) return;
+                    const nativeCoords = parseCoordinates(nativeText);
+                    const nativeMeta = buildExtractionMeta(nativeText, nativeCoords);
+                    const nativeAnalysis = analyzeCoordinates(nativeCoords, nativeMeta);
+                    if (nativeCoords.length >= 3 && (nativeAnalysis.quality === 'verified' || (nativeAnalysis.quality === 'consistent' && nativeCoords.length >= 8))) {
+                        setExtractMeta(nativeMeta);
+                        setExtractSource('Read from the PDF text layer (exact file numbers, not AI).');
+                        setCoordinates(withIds(nativeCoords));
+                        return;
+                    }
+                } catch (nativeErr) {
+                    if (nativeErr?.name === 'AbortError') throw nativeErr;
+                }
+
+                const geminiKey = process.env.REACT_APP_GEMINI_API_KEY;
+                if (!geminiKey) {
+                    setError('This PDF has no usable text layer, and Gemini is not configured in this site build. In Netlify, set REACT_APP_GEMINI_API_KEY, then Deploys → Trigger deploy → Clear cache and deploy site.');
+                    return;
+                }
+
                 setExtractStatus('Rendering PDF pages for Gemini...');
                 const imageUrls = await pdfToImageDataUrls(file, {
                     signal: controller.signal,
                     onProgress: setExtractStatus,
                 });
                 if (isCancelled()) return;
-                setExtractStatus('Sending images to Gemini...');
                 const imageParts = imageUrls.map((url) => {
                     const comma = url.indexOf(',');
                     const mime = url.startsWith('data:image/jpeg') ? 'image/jpeg' : 'image/png';
                     return { inline_data: { mime_type: mime, data: url.slice(comma + 1) } };
                 });
-                const payload = {
-                    contents: [{
-                        parts: [
-                            { text: prompt },
-                            ...imageParts
-                        ]
-                    }],
-                    generationConfig: {
-                        temperature: 0,
-                        maxOutputTokens: 8192
-                    }
-                };
                 const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${geminiKey}`;
-                const response = await fetch(apiUrl, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(payload),
-                    signal: controller.signal
-                });
-                if (isCancelled()) return;
-                const data = await response.json().catch(() => ({}));
-                if (!response.ok) {
-                    const apiMessage = data?.error?.message || `API call failed with status: ${response.status}`;
-                    if (response.status === 429) {
-                        setError(`Gemini rate limit exceeded. Wait a few minutes and try once. Confirm this Netlify build includes REACT_APP_GEMINI_API_KEY from the paid project. (${apiMessage})`);
-                    } else {
-                        setError(`Gemini error (${response.status}): ${apiMessage}`);
+                const callGemini = async (textPrompt) => {
+                    const payload = {
+                        contents: [{
+                            parts: [
+                                { text: textPrompt },
+                                ...imageParts
+                            ]
+                        }],
+                        generationConfig: {
+                            temperature: 0,
+                            maxOutputTokens: 16384
+                        }
+                    };
+                    const response = await fetch(apiUrl, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload),
+                        signal: controller.signal
+                    });
+                    if (isCancelled()) return '';
+                    const data = await response.json().catch(() => ({}));
+                    if (!response.ok) {
+                        const apiMessage = data?.error?.message || `API call failed with status: ${response.status}`;
+                        if (response.status === 429) {
+                            throw new Error(`Gemini rate limit exceeded. Wait a few minutes and try once. Confirm this Netlify build includes REACT_APP_GEMINI_API_KEY from the paid project. (${apiMessage})`);
+                        }
+                        throw new Error(`Gemini error (${response.status}): ${apiMessage}`);
                     }
-                    return;
+                    const parts = data.candidates?.[0]?.content?.parts || [];
+                    const extractedText = parts.map((part) => part.text).filter(Boolean).join('\n');
+                    const finishReason = data.candidates?.[0]?.finishReason;
+                    if (!extractedText) {
+                        const block = data.promptFeedback?.blockReason;
+                        throw new Error(block
+                            ? `Gemini blocked the document (${block}).`
+                            : `No text in Gemini response${finishReason ? ` (${finishReason})` : ''}.`);
+                    }
+                    return extractedText;
+                };
+
+                setExtractStatus('Sending images to Gemini…');
+                let combinedText = await callGemini(EXTRACT_PROMPT);
+                let parsedCoords = parseCoordinates(combinedText);
+                let meta = buildExtractionMeta(combinedText, parsedCoords);
+                if (isCancelled()) return;
+                for (let pass = 1; pass <= 2 && shouldContinueExtraction(parsedCoords, meta); pass++) {
+                    if (isCancelled()) return;
+                    setExtractStatus(`Table looks incomplete (${parsedCoords.length} vertices). Reading remaining rows (pass ${pass + 1})…`);
+                    const moreText = await callGemini(continuationPrompt(parsedCoords));
+                    if (isCancelled()) return;
+                    combinedText = `${combinedText}\n${moreText}`;
+                    const merged = mergeCoordinateLists(parsedCoords, parseCoordinates(moreText));
+                    if (merged.length <= parsedCoords.length) break;
+                    parsedCoords = merged;
+                    meta = buildExtractionMeta(combinedText, parsedCoords);
                 }
-                const parts = data.candidates?.[0]?.content?.parts || [];
-                const extractedText = parts.map((part) => part.text).filter(Boolean).join('\n');
-                const finishReason = data.candidates?.[0]?.finishReason;
-                if (!extractedText) {
-                    const block = data.promptFeedback?.blockReason;
-                    throw new Error(block
-                        ? `Gemini blocked the document (${block}).`
-                        : `No text in Gemini response${finishReason ? ` (${finishReason})` : ''}.`);
-                }
-                const parsedCoords = parseCoordinates(extractedText);
-                const finalCoordinates = parsedCoords.map((coord, index) => ({
-                    id: index,
-                    x: coord.x,
-                    y: coord.y
-                }));
-                setCoordinates(finalCoordinates);
-                if (finalCoordinates.length === 0) {
+                setExtractMeta(meta);
+                setExtractSource('Read by Gemini and checked against printed area / side lengths when those appear on the drawing.');
+                setCoordinates(withIds(parsedCoords));
+                if (parsedCoords.length === 0) {
                     setError("Could not find any coordinates. The document might have an unusual format or contain no coordinate tables.");
                 }
             } catch (err) {
                 if (isCancelled() || err.name === 'AbortError') return;
-                setError(`Gemini error: ${err.message}`);
+                setError(err.message.startsWith('Gemini') ? err.message : `Gemini error: ${err.message}`);
             } finally {
                 clearTimeout(timeoutId);
                 if (!cancelled) {
@@ -264,14 +342,14 @@ const App = () => {
     };
 
 
-    const analysis = coordinates.length ? analyzeCoordinates(coordinates) : null;
+    const analysis = coordinates.length ? analyzeCoordinates(coordinates, extractMeta || {}) : null;
 
     return (
         <div className="bg-gray-100 min-h-screen font-sans">
             <div className="container mx-auto p-4 md:p-8">
                 <header className="text-center mb-8">
                     <h1 className="text-4xl font-bold text-gray-800">Coordinate Extractor</h1>
-                    <p className="text-gray-600 mt-2">Upload a PDF to automatically extract coordinate pairs.</p>
+                    <p className="text-gray-600 mt-2">Upload a topographic PDF. Vector drawings are read from the file; scans are read by Gemini and checked against printed area and side lengths.</p>
                     {HAS_GEMINI_KEY ? (
                         <p className="text-sm text-green-700 mt-2">This build uses Gemini.</p>
                     ) : (
@@ -320,7 +398,7 @@ const App = () => {
                             {extractStatus && (
                                 <p className="mt-2 text-sm text-gray-500">{extractStatus}</p>
                             )}
-                            <p className="mt-2 text-xs text-gray-400">Large scanned drawings can take up to 3 minutes.</p>
+                            <p className="mt-2 text-xs text-gray-400">Large scanned drawings can take up to 5 minutes.</p>
                         </div>
                     )}
 
@@ -336,7 +414,7 @@ const App = () => {
                     )}
 
                     {!isLoading && coordinates.length > 0 && (
-                        <ResultsTable coordinates={coordinates} analysis={analysis} onCopyToClipboard={copyToClipboard} />
+                        <ResultsTable coordinates={coordinates} analysis={analysis} source={extractSource} onCopyToClipboard={copyToClipboard} />
                     )}
                     
                 </div>

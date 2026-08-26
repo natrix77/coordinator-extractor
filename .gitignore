@@ -19,6 +19,11 @@
 .env.production.local
 .env
 
+tmp_*
+tmp_*.txt
+tmp_*.json
+tmp_*.py
+
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*

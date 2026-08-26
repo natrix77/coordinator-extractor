@@ -9,10 +9,12 @@ if (typeof window !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
   pdfjsLib.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@${pdfjsLib.version}/legacy/build/pdf.worker.min.mjs`;
 }
 
-const SCALE = 2;
-const TILE_SCALE = 2.2;
-const MAX_PAGES = 10; // Limit pages to avoid huge payloads and timeouts
-const LARGE_PAGE_PT = 1400; // Scanned topo sheets are often much larger than this
+const SCALE = 2.2;
+const TABLE_SCALE = 2.4;
+const MAX_PAGES = 10;
+const LARGE_PAGE_PT = 1400;
+// Portrait scans of landscape drawings need a 90° CW rotate so the table is upright.
+const PORTRAIT_SCAN_ROTATION = 90;
 
 const abortError = () => {
   const err = new Error('Aborted');
@@ -66,38 +68,71 @@ export async function pdfToImageDataUrls(file, { signal, onProgress } = {}) {
     const page = await pdf.getPage(i);
     const baseViewport = page.getViewport({ scale: 1 });
     const isLargePage = baseViewport.width > LARGE_PAGE_PT || baseViewport.height > LARGE_PAGE_PT;
+    const forcePortraitRotate = isLargePage && baseViewport.height > baseViewport.width * 1.1;
+    const rotation = forcePortraitRotate ? PORTRAIT_SCAN_ROTATION : undefined;
+    const viewportOpts = (scale) => (rotation == null ? { scale } : { scale, rotation });
 
     if (isLargePage) {
-      // Dense coordinate tables on A0/A1 scans are unreadable at full-page scale.
-      // Send overlapping 2×2 tiles at higher resolution instead.
-      const viewport = page.getViewport({ scale: TILE_SCALE });
-      const tileW = Math.ceil(viewport.width / 2);
-      const tileH = Math.ceil(viewport.height / 2);
-      const overlapX = Math.round(tileW * 0.12);
-      const overlapY = Math.round(tileH * 0.12);
-      let tileIndex = 0;
-      for (let row = 0; row < 2; row++) {
-        for (let col = 0; col < 2; col++) {
-          tileIndex += 1;
-          const sx = Math.max(0, col * tileW - overlapX);
-          const sy = Math.max(0, row * tileH - overlapY);
-          const w = Math.min(viewport.width - sx, tileW + overlapX);
-          const h = Math.min(viewport.height - sy, tileH + overlapY);
-          dataUrls.push(await renderPageRegion(page, viewport, {
-            sx, sy, w, h, signal, onProgress,
-            label: `Rendering page ${i}, tile ${tileIndex} of 4…`,
-          }));
-        }
+      // High-res overlapping strips of the left side (coordinate table), then an overview.
+      const viewport = page.getViewport(viewportOpts(TABLE_SCALE));
+      const tableW = Math.ceil(viewport.width * 0.5);
+      const strips = 4;
+      const sliceH = Math.ceil(viewport.height / strips);
+      const overlap = Math.round(sliceH * 0.18);
+      for (let s = 0; s < strips; s++) {
+        const sy = Math.max(0, s * sliceH - overlap);
+        const h = Math.min(viewport.height - sy, sliceH + overlap);
+        dataUrls.push(await renderPageRegion(page, viewport, {
+          sx: 0,
+          sy,
+          w: tableW,
+          h,
+          signal,
+          onProgress,
+          label: `Rendering coordinate table strip ${s + 1} of ${strips}…`,
+        }));
       }
+
+      const overview = page.getViewport(viewportOpts(0.65));
+      dataUrls.push(await renderPageRegion(page, overview, {
+        w: overview.width,
+        h: overview.height,
+        signal,
+        onProgress,
+        label: `Rendering page ${i} overview…`,
+      }));
     } else {
-      const viewport = page.getViewport({ scale: SCALE });
-      dataUrls.push(await renderPageRegion(page, viewport, {
-        w: viewport.width,
-        h: viewport.height,
+      const overview = page.getViewport(viewportOpts(SCALE));
+      dataUrls.push(await renderPageRegion(page, overview, {
+        w: overview.width,
+        h: overview.height,
         signal,
         onProgress,
         label: `Rendering page ${i} of ${numPages}…`,
       }));
+      // Extra left/right crops on early pages so small table digits stay readable.
+      if (i <= 2) {
+        const closeUp = page.getViewport(viewportOpts(2.8));
+        const half = Math.ceil(closeUp.width * 0.58);
+        dataUrls.push(await renderPageRegion(page, closeUp, {
+          sx: 0,
+          sy: 0,
+          w: half,
+          h: closeUp.height,
+          signal,
+          onProgress,
+          label: `Rendering left side of page ${i}…`,
+        }));
+        dataUrls.push(await renderPageRegion(page, closeUp, {
+          sx: closeUp.width - half,
+          sy: 0,
+          w: half,
+          h: closeUp.height,
+          signal,
+          onProgress,
+          label: `Rendering right side of page ${i}…`,
+        }));
+      }
     }
   }
 
