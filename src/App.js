@@ -3,11 +3,8 @@ import { useDropzone } from 'react-dropzone';
 import { pdfToImageDataUrls } from './pdfToImages';
 import { parseCoordinates, analyzeCoordinates, formatArea } from './coordinates';
 
-const GEMINI_MODEL = 'gemini-2.5-flash';
-const OPENROUTER_MODELS = [
-    'google/gemini-2.5-flash',
-    'google/gemini-2.5-flash-lite',
-];
+const GEMINI_MODEL = 'gemini-3.6-flash';
+const HAS_GEMINI_KEY = Boolean(process.env.REACT_APP_GEMINI_API_KEY);
 
 // --- React Components ---
 
@@ -148,17 +145,20 @@ const App = () => {
             return;
         }
 
+        const geminiKey = process.env.REACT_APP_GEMINI_API_KEY;
+        if (!geminiKey) {
+            setError('Gemini is not configured in this site build. In Netlify, set REACT_APP_GEMINI_API_KEY, then Deploys -> Trigger deploy -> Clear cache and deploy site.');
+            return;
+        }
+
         setIsLoading(true);
-        setExtractStatus('Starting…');
+        setExtractStatus('Starting Gemini...');
         setError('');
         setCoordinates([]);
 
-        const openRouterKey = process.env.REACT_APP_OPENROUTER_API_KEY;
-        const openaiKey = process.env.REACT_APP_OPENAI_API_KEY;
-        const geminiKey = process.env.REACT_APP_GEMINI_API_KEY;
         const controller = new AbortController();
         let cancelled = false;
-        const timeoutMs = 180000; // 3 min — large scanned sheets send multiple tiles
+        const timeoutMs = 180000;
         const timeoutId = setTimeout(() => {
             cancelled = true;
             controller.abort();
@@ -167,204 +167,74 @@ const App = () => {
             setError('The request took too long and was cancelled. Please try again with a smaller file.');
         }, timeoutMs);
         const isCancelled = () => cancelled || controller.signal.aborted;
-        const imageOptions = {
-            signal: controller.signal,
-            onProgress: setExtractStatus,
-        };
-        const prompt = "Extract EVERY row from the vertex coordinate table (ΠΙΝΑΚΑΣ ΣΥΝΤΕΤΑΓΜΕΝΩΝ / columns A/A or Κορυφές, X, Y). Return one vertex per line as: <index> <X> <Y> using the exact printed digits. Copy every numbered row from first to last. Do not skip, merge, interpolate, or invent points. Do not include the L/πλευρά length column, headers, or any other text.";
-
-        const setExtractError = (err, provider) => {
-            if (err.name === 'AbortError') {
-                setError('The request took too long and was cancelled. Please try again with a smaller file.');
-            } else if (err.status === 429) {
-                const base = 'Rate limit exceeded. Please wait a few minutes and try again.';
-                const hint = provider === 'OpenAI'
-                    ? ' You can check usage and limits at platform.openai.com.'
-                    : provider === 'OpenRouter'
-                    ? ' Check openrouter.ai/dashboard for limits.'
-                    : provider ? ` (${provider})` : '';
-                setError(base + hint);
-            } else {
-                setError(`An error occurred: ${err.message}. Please try again.`);
-            }
-        };
-
-        const abortErr = () => Object.assign(new Error('Aborted'), { name: 'AbortError' });
-        const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-        const applyExtractedText = (extractedText) => {
-            if (isCancelled()) return;
-            const parsedCoords = parseCoordinates(extractedText);
-            const finalCoordinates = parsedCoords.map((coord, index) => ({
-                id: index,
-                x: coord.x,
-                y: coord.y
-            }));
-            setCoordinates(finalCoordinates);
-            if (finalCoordinates.length === 0) {
-                setError("Could not find any coordinates. The document might have an unusual format or contain no coordinate tables.");
-            }
-        };
-
-        const runGeminiExtract = async (pdfFile, { retryOn429 } = {}) => {
-            setExtractStatus('Reading PDF for Gemini…');
-            const base64Data = await new Promise((resolve, reject) => {
-                const fr = new FileReader();
-                fr.onload = () => resolve(fr.result.split(',')[1]);
-                fr.onerror = () => reject(new Error('Failed to read file'));
-                fr.readAsDataURL(pdfFile);
-            });
-            if (isCancelled()) throw abortErr();
-            setExtractStatus('Sending PDF to Gemini…');
-            const payload = {
-                contents: [{ parts: [{ text: prompt }, { inline_data: { mime_type: pdfFile.type || 'application/pdf', data: base64Data } }] }]
-            };
-            const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${geminiKey}`;
-            const doFetch = () => fetch(apiUrl, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload),
-                signal: controller.signal
-            });
-            let response = await doFetch();
-            if (response.status === 429 && retryOn429) {
-                for (const wait of [15, 30]) {
-                    setExtractStatus(`Gemini rate limited. Retrying in ${wait}s…`);
-                    await sleep(wait * 1000);
-                    if (isCancelled()) throw abortErr();
-                    setExtractStatus('Sending PDF to Gemini…');
-                    response = await doFetch();
-                    if (response.status !== 429) break;
-                }
-            }
-            if (!response.ok) throw Object.assign(new Error(`API call failed with status: ${response.status}`), { status: response.status });
-            const data = await response.json();
-            const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
-            if (!text) throw new Error('No content found in API response.');
-            return text;
-        };
-
-        const runOpenAIExtract = async (pdfFile, { retryOn429 } = {}) => {
-            setExtractStatus('Preparing images for OpenAI…');
-            const imageUrls = await pdfToImageDataUrls(pdfFile, imageOptions);
-            setExtractStatus('Sending to OpenAI…');
-            const body = JSON.stringify({
-                model: 'gpt-4o',
-                messages: [{ role: 'user', content: [
-                    { type: 'text', text: prompt },
-                    ...imageUrls.map(url => ({ type: 'image_url', image_url: { url } }))
-                ] }],
-                max_tokens: 8192
-            });
-            const doFetch = () => fetch('https://api.openai.com/v1/chat/completions', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${openaiKey}` },
-                body,
-                signal: controller.signal
-            });
-            let response = await doFetch();
-            if (response.status === 429 && retryOn429) {
-                setExtractStatus('OpenAI rate limited. Retrying in 15s…');
-                await sleep(15000);
-                if (isCancelled()) throw abortErr();
-                setExtractStatus('Sending to OpenAI…');
-                response = await doFetch();
-            }
-            if (!response.ok) throw Object.assign(new Error(`API call failed with status: ${response.status}`), { status: response.status });
-            const result = await response.json();
-            const text = result.choices?.[0]?.message?.content;
-            if (!text) throw new Error("No content found in API response.");
-            return text;
-        };
-
-        const runOpenRouterExtract = async (pdfFile) => {
-            setExtractStatus('Preparing images for OpenRouter…');
-            const imageUrls = await pdfToImageDataUrls(pdfFile, imageOptions);
-            let lastError;
-            for (const model of OPENROUTER_MODELS) {
-                setExtractStatus(`Sending to OpenRouter (${model})…`);
-                const body = JSON.stringify({
-                    model,
-                    messages: [{ role: 'user', content: [
-                        { type: 'text', text: prompt },
-                        ...imageUrls.map(url => ({ type: 'image_url', image_url: { url } }))
-                    ] }],
-                    max_tokens: 8192
-                });
-                const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'Authorization': `Bearer ${openRouterKey}`,
-                        'HTTP-Referer': window.location.origin || 'https://localhost:3000'
-                    },
-                    body,
-                    signal: controller.signal
-                });
-                if (response.ok) {
-                    const result = await response.json();
-                    const text = result.choices?.[0]?.message?.content;
-                    if (text) return text;
-                }
-                lastError = Object.assign(new Error(`API call failed with status: ${response.status}`), { status: response.status });
-                if (response.status !== 404) break;
-            }
-            throw lastError;
-        };
-
-        const providers = [];
-        if (geminiKey) providers.push('gemini');
-        if (openRouterKey) providers.push('openrouter');
-        if (openaiKey) providers.push('openai');
-
-        if (providers.length === 0) {
-            setError('No API key configured. Add REACT_APP_OPENROUTER_API_KEY, REACT_APP_GEMINI_API_KEY, or REACT_APP_OPENAI_API_KEY to your .env file.');
-            setIsLoading(false);
-            setExtractStatus('');
-            clearTimeout(timeoutId);
-            return;
-        }
-
-        const providerLabel = { gemini: 'Gemini', openrouter: 'OpenRouter', openai: 'OpenAI' };
+        const prompt = "Extract EVERY row from the vertex coordinate table (ΠΙΝΑΚΑΣ ΣΥΝΤΕΤΑΓΜΕΝΩΝ / columns A/A or Κορυφές, X, Y). Return one vertex per line as: index X Y using the exact printed digits. Copy every numbered row from first to last. Do not skip, merge, interpolate, or invent points. Do not include the L/πλευρά length column, headers, or any other text.";
 
         (async () => {
-            const rateLimited = [];
-            let lastErr;
-            let lastProvider = providers[0];
             try {
-                for (let i = 0; i < providers.length; i++) {
-                    if (isCancelled()) return;
-                    const name = providers[i];
-                    const isLast = i === providers.length - 1;
-                    lastProvider = name;
-                    try {
-                        let text;
-                        if (name === 'gemini') text = await runGeminiExtract(file, { retryOn429: isLast });
-                        else if (name === 'openrouter') text = await runOpenRouterExtract(file);
-                        else text = await runOpenAIExtract(file, { retryOn429: isLast });
-                        if (isCancelled()) return;
-                        applyExtractedText(text);
-                        return;
-                    } catch (err) {
-                        if (isCancelled() || err.name === 'AbortError') return;
-                        lastErr = err;
-                        if (err.status === 429) {
-                            rateLimited.push(providerLabel[name]);
-                            if (!isLast) {
-                                setExtractStatus(`${providerLabel[name]} rate limited. Trying the next API…`);
-                                continue;
-                            }
-                        } else if (!isLast) {
-                            setExtractStatus(`${providerLabel[name]} failed. Trying the next API…`);
-                            continue;
-                        }
+                setExtractStatus('Rendering PDF pages for Gemini...');
+                const imageUrls = await pdfToImageDataUrls(file, {
+                    signal: controller.signal,
+                    onProgress: setExtractStatus,
+                });
+                if (isCancelled()) return;
+                setExtractStatus('Sending images to Gemini...');
+                const imageParts = imageUrls.map((url) => {
+                    const comma = url.indexOf(',');
+                    const mime = url.startsWith('data:image/jpeg') ? 'image/jpeg' : 'image/png';
+                    return { inline_data: { mime_type: mime, data: url.slice(comma + 1) } };
+                });
+                const payload = {
+                    contents: [{
+                        parts: [
+                            { text: prompt },
+                            ...imageParts
+                        ]
+                    }],
+                    generationConfig: {
+                        temperature: 0,
+                        maxOutputTokens: 8192
                     }
+                };
+                const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${geminiKey}`;
+                const response = await fetch(apiUrl, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload),
+                    signal: controller.signal
+                });
+                if (isCancelled()) return;
+                const data = await response.json().catch(() => ({}));
+                if (!response.ok) {
+                    const apiMessage = data?.error?.message || `API call failed with status: ${response.status}`;
+                    if (response.status === 429) {
+                        setError(`Gemini rate limit exceeded. Wait a few minutes and try once. Confirm this Netlify build includes REACT_APP_GEMINI_API_KEY from the paid project. (${apiMessage})`);
+                    } else {
+                        setError(`Gemini error (${response.status}): ${apiMessage}`);
+                    }
+                    return;
                 }
-                if (rateLimited.length && lastErr?.status === 429) {
-                    setError(`All configured APIs are rate limited (${rateLimited.join(', ')}). Wait a few minutes and try once — repeated retries make this worse.`);
-                } else if (lastErr) {
-                    setExtractError(lastErr, providerLabel[lastProvider]);
+                const parts = data.candidates?.[0]?.content?.parts || [];
+                const extractedText = parts.map((part) => part.text).filter(Boolean).join('\n');
+                const finishReason = data.candidates?.[0]?.finishReason;
+                if (!extractedText) {
+                    const block = data.promptFeedback?.blockReason;
+                    throw new Error(block
+                        ? `Gemini blocked the document (${block}).`
+                        : `No text in Gemini response${finishReason ? ` (${finishReason})` : ''}.`);
                 }
+                const parsedCoords = parseCoordinates(extractedText);
+                const finalCoordinates = parsedCoords.map((coord, index) => ({
+                    id: index,
+                    x: coord.x,
+                    y: coord.y
+                }));
+                setCoordinates(finalCoordinates);
+                if (finalCoordinates.length === 0) {
+                    setError("Could not find any coordinates. The document might have an unusual format or contain no coordinate tables.");
+                }
+            } catch (err) {
+                if (isCancelled() || err.name === 'AbortError') return;
+                setError(`Gemini error: ${err.message}`);
             } finally {
                 clearTimeout(timeoutId);
                 if (!cancelled) {
@@ -402,6 +272,11 @@ const App = () => {
                 <header className="text-center mb-8">
                     <h1 className="text-4xl font-bold text-gray-800">Coordinate Extractor</h1>
                     <p className="text-gray-600 mt-2">Upload a PDF to automatically extract coordinate pairs.</p>
+                    {HAS_GEMINI_KEY ? (
+                        <p className="text-sm text-green-700 mt-2">This build uses Gemini.</p>
+                    ) : (
+                        <p className="text-sm text-amber-700 mt-2">Gemini key is missing from this build. Set REACT_APP_GEMINI_API_KEY on Netlify, then Clear cache and deploy.</p>
+                    )}
                 </header>
 
                 <div className="max-w-4xl mx-auto bg-white p-6 rounded-xl shadow-lg">
@@ -466,7 +341,7 @@ const App = () => {
                     
                 </div>
                  <footer className="text-center mt-8 text-gray-500 text-sm">
-                    <p>Powered by Gemini or OpenAI</p>
+                    <p>Powered by Gemini</p>
                 </footer>
             </div>
         </div>

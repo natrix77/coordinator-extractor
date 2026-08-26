@@ -17,3 +17,8 @@ test('renders upload instructions', () => {
   const instructions = screen.getByText(/Upload a PDF to automatically extract coordinate pairs/i);
   expect(instructions).toBeInTheDocument();
 });
+
+test('renders Gemini-powered footer', () => {
+  render(<App />);
+  expect(screen.getByText(/Powered by Gemini/i)).toBeInTheDocument();
+});
