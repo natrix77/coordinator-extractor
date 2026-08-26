@@ -189,6 +189,9 @@ const App = () => {
             }
         };
 
+        const abortErr = () => Object.assign(new Error('Aborted'), { name: 'AbortError' });
+        const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
         const applyExtractedText = (extractedText) => {
             if (isCancelled()) return;
             const parsedCoords = parseCoordinates(extractedText);
@@ -203,17 +206,54 @@ const App = () => {
             }
         };
 
-        const runOpenAIExtract = async (pdfFile) => {
+        const runGeminiExtract = async (pdfFile, { retryOn429 } = {}) => {
+            setExtractStatus('Reading PDF for Gemini…');
+            const base64Data = await new Promise((resolve, reject) => {
+                const fr = new FileReader();
+                fr.onload = () => resolve(fr.result.split(',')[1]);
+                fr.onerror = () => reject(new Error('Failed to read file'));
+                fr.readAsDataURL(pdfFile);
+            });
+            if (isCancelled()) throw abortErr();
+            setExtractStatus('Sending PDF to Gemini…');
+            const payload = {
+                contents: [{ parts: [{ text: prompt }, { inline_data: { mime_type: pdfFile.type || 'application/pdf', data: base64Data } }] }]
+            };
+            const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${geminiKey}`;
+            const doFetch = () => fetch(apiUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload),
+                signal: controller.signal
+            });
+            let response = await doFetch();
+            if (response.status === 429 && retryOn429) {
+                for (const wait of [15, 30]) {
+                    setExtractStatus(`Gemini rate limited. Retrying in ${wait}s…`);
+                    await sleep(wait * 1000);
+                    if (isCancelled()) throw abortErr();
+                    setExtractStatus('Sending PDF to Gemini…');
+                    response = await doFetch();
+                    if (response.status !== 429) break;
+                }
+            }
+            if (!response.ok) throw Object.assign(new Error(`API call failed with status: ${response.status}`), { status: response.status });
+            const data = await response.json();
+            const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+            if (!text) throw new Error('No content found in API response.');
+            return text;
+        };
+
+        const runOpenAIExtract = async (pdfFile, { retryOn429 } = {}) => {
             setExtractStatus('Preparing images for OpenAI…');
             const imageUrls = await pdfToImageDataUrls(pdfFile, imageOptions);
             setExtractStatus('Sending to OpenAI…');
-            const content = [
-                { type: 'text', text: prompt },
-                ...imageUrls.map(url => ({ type: 'image_url', image_url: { url } }))
-            ];
             const body = JSON.stringify({
                 model: 'gpt-4o',
-                messages: [{ role: 'user', content }],
+                messages: [{ role: 'user', content: [
+                    { type: 'text', text: prompt },
+                    ...imageUrls.map(url => ({ type: 'image_url', image_url: { url } }))
+                ] }],
                 max_tokens: 8192
             });
             const doFetch = () => fetch('https://api.openai.com/v1/chat/completions', {
@@ -223,11 +263,10 @@ const App = () => {
                 signal: controller.signal
             });
             let response = await doFetch();
-            const backoffSeconds = [8, 20, 45];
-            for (let i = 0; i < backoffSeconds.length && response.status === 429; i++) {
-                setExtractStatus(`OpenAI rate limited. Retrying in ${backoffSeconds[i]}s…`);
-                await new Promise(r => setTimeout(r, backoffSeconds[i] * 1000));
-                if (isCancelled()) throw Object.assign(new Error('Aborted'), { name: 'AbortError' });
+            if (response.status === 429 && retryOn429) {
+                setExtractStatus('OpenAI rate limited. Retrying in 15s…');
+                await sleep(15000);
+                if (isCancelled()) throw abortErr();
                 setExtractStatus('Sending to OpenAI…');
                 response = await doFetch();
             }
@@ -241,7 +280,6 @@ const App = () => {
         const runOpenRouterExtract = async (pdfFile) => {
             setExtractStatus('Preparing images for OpenRouter…');
             const imageUrls = await pdfToImageDataUrls(pdfFile, imageOptions);
-            setExtractStatus('Sending to OpenRouter…');
             let lastError;
             for (const model of OPENROUTER_MODELS) {
                 setExtractStatus(`Sending to OpenRouter (${model})…`);
@@ -274,218 +312,67 @@ const App = () => {
             throw lastError;
         };
 
-        // Try OpenRouter first (free tier). On any failure, fall back to Gemini then OpenAI so one working key is enough.
-        if (openRouterKey) {
-            (async () => {
-                try {
-                    const text = await runOpenRouterExtract(file);
-                    if (isCancelled()) return;
-                    applyExtractedText(text);
-                } catch (err) {
-                    if (isCancelled()) return;
-                    let lastErr = err;
-                    if (geminiKey) {
-                        try {
-                            setExtractStatus('OpenRouter failed. Sending PDF to Gemini…');
-                            const base64Data = await new Promise((resolve, reject) => {
-                                const fr = new FileReader();
-                                fr.onload = () => resolve(fr.result.split(',')[1]);
-                                fr.onerror = () => reject(new Error('Failed to read file'));
-                                fr.readAsDataURL(file);
-                            });
-                            if (isCancelled()) return;
-                            setExtractStatus('Waiting for Gemini…');
-                            const payload = {
-                                contents: [{ parts: [{ text: prompt }, { inline_data: { mime_type: file.type, data: base64Data } }] }]
-                            };
-                            const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${geminiKey}`, {
-                                method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload), signal: controller.signal
-                            });
-                            if (!res.ok) {
-                                throw Object.assign(new Error(`API call failed with status: ${res.status}`), { status: res.status });
-                            }
-                            const data = await res.json();
-                            const t = data.candidates?.[0]?.content?.parts?.[0]?.text;
-                            if (t) { applyExtractedText(t); return; }
-                            throw new Error('No content found in API response.');
-                        } catch (fallbackErr) {
-                            if (isCancelled()) return;
-                            lastErr = fallbackErr;
-                        }
-                    }
-                    if (openaiKey) {
-                        try {
-                            setExtractStatus('Trying OpenAI…');
-                            const t = await runOpenAIExtract(file);
-                            if (isCancelled()) return;
-                            applyExtractedText(t);
-                            return;
-                        } catch (fallbackErr) {
-                            if (isCancelled()) return;
-                            lastErr = fallbackErr;
-                        }
-                    }
-                    setExtractError(lastErr, lastErr === err ? 'OpenRouter' : (geminiKey ? 'Gemini' : 'OpenAI'));
-                } finally {
-                    clearTimeout(timeoutId);
-                    if (!cancelled) {
-                        setIsLoading(false);
-                        setExtractStatus('');
-                    }
-                }
-            })();
+        const providers = [];
+        if (geminiKey) providers.push('gemini');
+        if (openRouterKey) providers.push('openrouter');
+        if (openaiKey) providers.push('openai');
+
+        if (providers.length === 0) {
+            setError('No API key configured. Add REACT_APP_OPENROUTER_API_KEY, REACT_APP_GEMINI_API_KEY, or REACT_APP_OPENAI_API_KEY to your .env file.');
+            setIsLoading(false);
+            setExtractStatus('');
+            clearTimeout(timeoutId);
             return;
         }
 
-        // Prefer Gemini first (accepts PDF directly, avoids OpenAI rate limits). Fall back to OpenAI if only OpenAI key is set.
-        if (geminiKey) {
-            // --- Gemini: PDF base64 → Generate Content API. On 429: fall back to OpenAI if available, else retry with backoff. ---
-            setExtractStatus('Reading PDF for Gemini…');
-            const fileReader = new FileReader();
-            fileReader.onload = async (e) => {
-                try {
-                    if (isCancelled()) return;
-                    const base64Data = e.target.result.split(',')[1];
-                    const payload = {
-                        contents: [{
-                            parts: [
-                                { text: prompt },
-                                { inline_data: { mime_type: file.type, data: base64Data } }
-                            ]
-                        }]
-                    };
-                    const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${geminiKey}`;
-                    setExtractStatus('Sending PDF to Gemini…');
-                    let response = await fetch(apiUrl, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(payload),
-                        signal: controller.signal
-                    });
+        const providerLabel = { gemini: 'Gemini', openrouter: 'OpenRouter', openai: 'OpenAI' };
 
-                    if (response.status === 429 && openaiKey) {
+        (async () => {
+            const rateLimited = [];
+            let lastErr;
+            let lastProvider = providers[0];
+            try {
+                for (let i = 0; i < providers.length; i++) {
+                    if (isCancelled()) return;
+                    const name = providers[i];
+                    const isLast = i === providers.length - 1;
+                    lastProvider = name;
+                    try {
+                        let text;
+                        if (name === 'gemini') text = await runGeminiExtract(file, { retryOn429: isLast });
+                        else if (name === 'openrouter') text = await runOpenRouterExtract(file);
+                        else text = await runOpenAIExtract(file, { retryOn429: isLast });
                         if (isCancelled()) return;
-                        setExtractStatus('Gemini rate limited. Trying OpenAI…');
-                        try {
-                            const text = await runOpenAIExtract(file);
-                            applyExtractedText(text);
-                        } catch (fallbackErr) {
-                            if (!isCancelled()) setExtractError(fallbackErr, 'OpenAI');
-                        }
+                        applyExtractedText(text);
                         return;
-                    }
-
-                    if (response.status === 429) {
-                        const backoff = [10, 30, 60];
-                        for (let i = 0; i < backoff.length; i++) {
-                            setExtractStatus(`Gemini rate limited. Retrying in ${backoff[i]}s…`);
-                            await new Promise(r => setTimeout(r, backoff[i] * 1000));
-                            if (isCancelled()) return;
-                            setExtractStatus('Sending PDF to Gemini…');
-                            response = await fetch(apiUrl, {
-                                method: 'POST',
-                                headers: { 'Content-Type': 'application/json' },
-                                body: JSON.stringify(payload),
-                                signal: controller.signal
-                            });
-                            if (response.ok) break;
-                            if (response.status !== 429) break;
+                    } catch (err) {
+                        if (isCancelled() || err.name === 'AbortError') return;
+                        lastErr = err;
+                        if (err.status === 429) {
+                            rateLimited.push(providerLabel[name]);
+                            if (!isLast) {
+                                setExtractStatus(`${providerLabel[name]} rate limited. Trying the next API…`);
+                                continue;
+                            }
+                        } else if (!isLast) {
+                            setExtractStatus(`${providerLabel[name]} failed. Trying the next API…`);
+                            continue;
                         }
                     }
-
-                    if (isCancelled()) return;
-                    if (!response.ok) {
-                        const err = new Error(`API call failed with status: ${response.status}`);
-                        err.status = response.status;
-                        throw err;
-                    }
-                    const result = await response.json();
-                    if (result.candidates?.[0]?.content?.parts?.[0]?.text) {
-                        applyExtractedText(result.candidates[0].content.parts[0].text);
-                    } else {
-                        throw new Error("No content found in API response. The document might be empty or unreadable.");
-                    }
-                } catch (err) {
-                    if (!isCancelled()) setExtractError(err, 'Gemini');
-                } finally {
-                    clearTimeout(timeoutId);
-                    if (!cancelled) {
-                        setIsLoading(false);
-                        setExtractStatus('');
-                    }
                 }
-            };
-            fileReader.onerror = () => {
-                setError('Failed to read the file.');
-                setIsLoading(false);
-                setExtractStatus('');
+                if (rateLimited.length && lastErr?.status === 429) {
+                    setError(`All configured APIs are rate limited (${rateLimited.join(', ')}). Wait a few minutes and try once — repeated retries make this worse.`);
+                } else if (lastErr) {
+                    setExtractError(lastErr, providerLabel[lastProvider]);
+                }
+            } finally {
                 clearTimeout(timeoutId);
-            };
-            fileReader.readAsDataURL(file);
-            return;
-        }
-
-        if (openaiKey) {
-            // --- OpenAI: PDF → images → Vision API. On 429, retry with backoff. ---
-            (async () => {
-                try {
-                    const imageUrls = await pdfToImageDataUrls(file, imageOptions);
-                    setExtractStatus('Sending to OpenAI…');
-                    const content = [
-                        { type: 'text', text: prompt },
-                        ...imageUrls.map(url => ({ type: 'image_url', image_url: { url } }))
-                    ];
-                    const body = JSON.stringify({
-                        model: 'gpt-4o',
-                        messages: [{ role: 'user', content }],
-                        max_tokens: 8192
-                    });
-                    const doOpenAIFetch = () => fetch('https://api.openai.com/v1/chat/completions', {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                            'Authorization': `Bearer ${openaiKey}`
-                        },
-                        body,
-                        signal: controller.signal
-                    });
-
-                    let response = await doOpenAIFetch();
-                    const backoffSeconds = [8, 20, 45];
-                    for (let i = 0; i < backoffSeconds.length && response.status === 429; i++) {
-                        setExtractStatus(`OpenAI rate limited. Retrying in ${backoffSeconds[i]}s…`);
-                        await new Promise(r => setTimeout(r, backoffSeconds[i] * 1000));
-                        if (isCancelled()) return;
-                        setExtractStatus('Sending to OpenAI…');
-                        response = await doOpenAIFetch();
-                    }
-
-                    if (isCancelled()) return;
-                    if (!response.ok) {
-                        const err = new Error(`API call failed with status: ${response.status}`);
-                        err.status = response.status;
-                        throw err;
-                    }
-                    const result = await response.json();
-                    const text = result.choices?.[0]?.message?.content;
-                    if (!text) throw new Error("No content found in API response. The document might be empty or unreadable.");
-                    applyExtractedText(text);
-                } catch (err) {
-                    if (!isCancelled()) setExtractError(err, 'OpenAI');
-                } finally {
-                    clearTimeout(timeoutId);
-                    if (!cancelled) {
-                        setIsLoading(false);
-                        setExtractStatus('');
-                    }
+                if (!cancelled) {
+                    setIsLoading(false);
+                    setExtractStatus('');
                 }
-            })();
-            return;
-        }
-
-        setError('No API key configured. Add REACT_APP_OPENROUTER_API_KEY, REACT_APP_GEMINI_API_KEY, or REACT_APP_OPENAI_API_KEY to your .env file.');
-        setIsLoading(false);
-        clearTimeout(timeoutId);
+            }
+        })();
     };
 
     const copyToClipboard = () => {
