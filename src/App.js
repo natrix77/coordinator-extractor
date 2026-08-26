@@ -1,6 +1,7 @@
 import React, { useState, useCallback } from 'react';
 import { useDropzone } from 'react-dropzone';
 import { pdfToImageDataUrls } from './pdfToImages';
+import { parseCoordinates, analyzeCoordinates, formatArea } from './coordinates';
 
 const GEMINI_MODEL = 'gemini-2.5-flash';
 const OPENROUTER_MODELS = [
@@ -19,51 +20,6 @@ const Icon = ({ path, className = "w-6 h-6" }) => (
 const UploadIcon = () => <Icon path="M5.5 13.5a.5.5 0 0 1 .5.5v2a.5.5 0 0 1-1 0v-2a.5.5 0 0 1 .5-.5zM5 7.5a.5.5 0 0 1 .5-.5h2a.5.5 0 0 1 0 1h-2a.5.5 0 0 1-.5-.5zm.5 2.5a.5.5 0 0 0 0 1h5a.5.5 0 0 0 0-1h-5zM5 4.5a.5.5 0 0 1 .5-.5h5a.5.5 0 0 1 0 1h-5a.5.5 0 0 1-.5-.5zM11.5 16a.5.5 0 0 0-.5-.5h-2a.5.5 0 0 0 0 1h2a.5.5 0 0 0 .5-.5zm-1-4a.5.5 0 0 1 .5.5v1a.5.5 0 0 1-1 0v-1a.5.5 0 0 1 .5-.5zm-1 2.5a.5.5 0 0 0 0 1h5a.5.5 0 0 0 0-1h-5zM12 4.5a.5.5 0 0 1 .5-.5h2a.5.5 0 0 1 0 1h-2a.5.5 0 0 1-.5-.5zM2 2.5A2.5 2.5 0 0 1 4.5 0h11A2.5 2.5 0 0 1 18 2.5v15A2.5 2.5 0 0 1 15.5 20h-11A2.5 2.5 0 0 1 2 17.5v-15zM4.5 1h11a1.5 1.5 0 0 1 1.5 1.5v15a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 3 17.5v-15A1.5 1.5 0 0 1 4.5 1z" />;
 const CopyIcon = () => <Icon path="M8 2a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2H8zM2 6a2 2 0 0 1 2-2h1v12H4a2 2 0 0 1-2-2V6z" />;
 const ClearIcon = () => <Icon path="M10 18a8 8 0 1 0 0-16 8 8 0 0 0 0 16zM8.707 7.293a1 1 0 0 0-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 1 0 1.414 1.414L10 11.414l1.293 1.293a1 1 0 0 0 1.414-1.414L11.414 10l1.293-1.293a1 1 0 0 0-1.414-1.414L10 8.586 8.707 7.293z" />;
-
-/**
- * Parses the raw text extracted from the model to find coordinate pairs.
- * @param {string} text - The raw text from the AI model.
- * @returns {Array<Object>} An array of coordinate objects { x, y }.
- */
-const parseCoordinates = (text) => {
-    if (!text) return [];
-
-    const coordinates = [];
-    const lines = text.replace(/\r\n/g, '\n').split('\n');
-    // Match all pairs of numbers (integer or decimal, dot or comma) on each line.
-    const coordinateRegex = /([\d.,]+)\s+([\d.,]+)/g;
-
-    for (const line of lines) {
-        let cleanLine = line.trim();
-        if (!cleanLine) continue;
-        // Strip optional leading row index (e.g. A/A column) so "1 123,45 456,78" -> "123,45 456,78"
-        cleanLine = cleanLine.replace(/^\d+\s+/, '');
-        let match;
-        coordinateRegex.lastIndex = 0;
-        while ((match = coordinateRegex.exec(cleanLine)) !== null) {
-            try {
-                let val1 = parseFloat(match[1].replace(/,/g, '.'));
-                let val2 = parseFloat(match[2].replace(/,/g, '.'));
-
-                if (isNaN(val1) || isNaN(val2)) continue;
-
-                let x, y;
-                if (String(Math.trunc(val1)).length > String(Math.trunc(val2)).length) {
-                    y = val1;
-                    x = val2;
-                } else {
-                    x = val1;
-                    y = val2;
-                }
-
-                coordinates.push({ x: x.toFixed(2), y: y.toFixed(2) });
-            } catch (e) {
-                console.error("Error parsing line:", line, e);
-            }
-        }
-    }
-    return coordinates;
-};
 
 const Dropzone = ({ onFileAccepted, disabled }) => {
     const onDrop = useCallback(acceptedFiles => {
@@ -92,7 +48,7 @@ const Dropzone = ({ onFileAccepted, disabled }) => {
     );
 };
 
-const ResultsTable = ({ coordinates, onCopyToClipboard }) => (
+const ResultsTable = ({ coordinates, analysis, onCopyToClipboard }) => (
     <div className="mt-6">
         <div className="flex justify-between items-center mb-2">
             <h3 className="text-xl font-semibold text-gray-700">
@@ -107,6 +63,24 @@ const ResultsTable = ({ coordinates, onCopyToClipboard }) => (
                 <span className="ml-2">Copy X Y</span>
             </button>
         </div>
+        {analysis && (
+            <div className="mb-3 text-sm text-gray-600">
+                Computed area: <strong>{formatArea(analysis.area)} m²</strong>
+                {' · '}
+                Closing side: <strong>{analysis.gap.toFixed(2)} m</strong>
+                <span className="ml-1 text-gray-500">(compare area with ΕΜΒΑΔΟΝ on the drawing)</span>
+            </div>
+        )}
+        {analysis?.warnings?.length > 0 && (
+            <div className="mb-3 p-3 bg-amber-50 text-amber-900 border border-amber-300 rounded-lg text-sm">
+                <strong>Check extraction quality:</strong>
+                <ul className="list-disc ml-5 mt-1">
+                    {analysis.warnings.map((w, i) => (
+                        <li key={i}>{w}</li>
+                    ))}
+                </ul>
+            </div>
+        )}
         <div className="overflow-auto rounded-lg shadow" style={{maxHeight: '400px'}}>
             <table className="min-w-full divide-y divide-gray-200">
                 <thead className="bg-gray-100 sticky top-0">
@@ -165,9 +139,9 @@ const App = () => {
         const openaiKey = process.env.REACT_APP_OPENAI_API_KEY;
         const geminiKey = process.env.REACT_APP_GEMINI_API_KEY;
         const controller = new AbortController();
-        const timeoutMs = 120000; // 2 min for API extraction
+        const timeoutMs = 180000; // 3 min — large scanned sheets send multiple tiles
         const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-        const prompt = "Extract text from any tables containing coordinate pairs from this document. The table has columns like 'A/A', 'X', and 'Y'. Return only the raw text of the table rows, one row per line. Do not include headers or any other text.";
+        const prompt = "Extract EVERY row from the vertex coordinate table (ΠΙΝΑΚΑΣ ΣΥΝΤΕΤΑΓΜΕΝΩΝ / columns A/A or Κορυφές, X, Y). Return one vertex per line as: <index> <X> <Y> using the exact printed digits. Copy every numbered row from first to last. Do not skip, merge, interpolate, or invent points. Do not include the L/πλευρά length column, headers, or any other text.";
 
         const setExtractError = (err, provider) => {
             if (err.name === 'AbortError') {
@@ -207,7 +181,7 @@ const App = () => {
             const body = JSON.stringify({
                 model: 'gpt-4o',
                 messages: [{ role: 'user', content }],
-                max_tokens: 4096
+                max_tokens: 8192
             });
             const doFetch = () => fetch('https://api.openai.com/v1/chat/completions', {
                 method: 'POST',
@@ -239,7 +213,7 @@ const App = () => {
                 const body = JSON.stringify({
                     model,
                     messages: [{ role: 'user', content }],
-                    max_tokens: 4096
+                    max_tokens: 8192
                 });
                 const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
                     method: 'POST',
@@ -404,7 +378,7 @@ const App = () => {
                     const body = JSON.stringify({
                         model: 'gpt-4o',
                         messages: [{ role: 'user', content }],
-                        max_tokens: 4096
+                        max_tokens: 8192
                     });
                     const doOpenAIFetch = () => fetch('https://api.openai.com/v1/chat/completions', {
                         method: 'POST',
@@ -465,6 +439,8 @@ const App = () => {
         document.body.removeChild(textArea);
     };
 
+
+    const analysis = coordinates.length ? analyzeCoordinates(coordinates) : null;
 
     return (
         <div className="bg-gray-100 min-h-screen font-sans">
@@ -527,7 +503,7 @@ const App = () => {
                     )}
 
                     {!isLoading && coordinates.length > 0 && (
-                        <ResultsTable coordinates={coordinates} onCopyToClipboard={copyToClipboard} />
+                        <ResultsTable coordinates={coordinates} analysis={analysis} onCopyToClipboard={copyToClipboard} />
                     )}
                     
                 </div>

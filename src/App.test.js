@@ -1,6 +1,11 @@
 import { render, screen } from '@testing-library/react';
 import App from './App';
 
+jest.mock('./pdfToImages', () => ({
+    pdfToImageDataUrls: jest.fn(),
+    pdfToText: jest.fn(),
+}));
+
 test('renders Coordinate Extractor heading', () => {
   render(<App />);
   const heading = screen.getByText(/Coordinate Extractor/i);
